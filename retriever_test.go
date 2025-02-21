@@ -18,19 +18,19 @@ func TestRetrievalBasic(t *testing.T) {
 	docprefix := "doc:test_retrieval_basic"
 
 	retriever := &Retriever{
-		IndexName: indexname,
-		DocPrefix: docprefix,
-		RedisCli: redis.NewClient(&redis.Options{
+		indexName: indexname,
+		docPrefix: docprefix,
+		redisCli: redis.NewClient(&redis.Options{
 			Addr:     cmp.Or(os.Getenv("REDIS_URL"), "localhost:6379"),
 			Protocol: 2,
 		}),
 	}
 
-	retriever.RedisCli.FTDropIndexWithArgs(context.Background(), indexname, &redis.FTDropIndexOptions{DeleteDocs: true}).Result()
+	retriever.redisCli.FTDropIndexWithArgs(context.Background(), indexname, &redis.FTDropIndexOptions{DeleteDocs: true}).Result()
 
-	err := createIndex(retriever.RedisCli, indexname, docprefix)
+	err := CreateIndex(retriever.redisCli, DocumentSchema, indexname, []interface{}{docprefix})
 	should.Nil(t, err)
-	t.Log("index created")
+	t.Logf("index %s created", indexname)
 
 	docs := []*Document{
 		{Tag: "chatter", ID: "0", Content: "咱俩谁跟谁呀。", Payload: "k1:v1;k2:v2"},
@@ -67,30 +67,9 @@ func TestRetrievalBasic(t *testing.T) {
 		should.Equal(t, "3", docs[2].ID)
 	}
 
-	_, err = retriever.RedisCli.FTDropIndexWithArgs(context.Background(), indexname, &redis.FTDropIndexOptions{DeleteDocs: true}).Result()
+	_, err = retriever.redisCli.FTDropIndexWithArgs(context.Background(), indexname, &redis.FTDropIndexOptions{DeleteDocs: true}).Result()
 	should.Nil(t, err)
-	t.Log("index dropped")
-}
-
-func createIndex(cli *redis.Client, indexName string, docPrefix string) (err error) {
-	cmd := cli.FTCreate(context.Background(), indexName,
-		&redis.FTCreateOptions{Prefix: []interface{}{docPrefix}, OnJSON: true},
-		Schema...)
-	_, err = cmd.Result()
-	if err != nil {
-		return err
-	}
-	for {
-		var res redis.FTInfoResult
-		res, err = cli.FTInfo(context.Background(), indexName).Result()
-		if err != nil {
-			return err
-		}
-		if res.Indexing == 0 {
-			return
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
+	t.Logf("index %s dropped", indexname)
 }
 
 type str2vec map[string][]float64

@@ -9,111 +9,117 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-type (
-	Retriever struct {
-		IndexName string
-		DocPrefix string
-		RedisCli  *redis.Client
+var (
+	DocumentSchema []*redis.FieldSchema = []*redis.FieldSchema{
+		DocId,
+		DocTag,
+		DocContent,
+		DocPayload,
+		DocContentVec,
 	}
 
-	Document struct {
-		ID         string    `json:"id"`
-		Tag        string    `json:"tag"`
-		Content    string    `json:"content"`
-		ContentVec []float64 `json:"contentvec"`
-		Payload    string    `json:"payload"`
+	DocumentDefaultReturn = []redis.FTSearchReturn{
+		{FieldName: DocId.FieldName},
+		{FieldName: DocTag.FieldName},
+		{FieldName: DocContent.FieldName},
+		{FieldName: DocPayload.FieldName},
 	}
-)
 
-const (
-	field_id          = "$.id"
-	field_tag         = "$.tag"
-	field_content     = "$.content"
-	field_content_vec = "$.contentvec"
-	field_payload     = "$.payload"
-	field_score       = "score"
-)
-
-var Schema []*redis.FieldSchema = []*redis.FieldSchema{
-	{FieldName: field_id, As: "id", FieldType: redis.SearchFieldTypeText, NoIndex: true},
-	{FieldName: field_tag, As: "tag", FieldType: redis.SearchFieldTypeTag, Separator: ","},
-	{FieldName: field_content, As: "content", FieldType: redis.SearchFieldTypeText},
-	{FieldName: field_payload, As: "payload", FieldType: redis.SearchFieldTypeText, NoIndex: true},
-	{FieldName: field_content_vec, As: "contentvec", FieldType: redis.SearchFieldTypeVector,
+	DocId         = &redis.FieldSchema{FieldName: "$.id", As: "id", FieldType: redis.SearchFieldTypeText, NoIndex: true}
+	DocTag        = &redis.FieldSchema{FieldName: "$.tag", As: "tag", FieldType: redis.SearchFieldTypeTag, Separator: ","}
+	DocContent    = &redis.FieldSchema{FieldName: "$.content", As: "content", FieldType: redis.SearchFieldTypeText}
+	DocPayload    = &redis.FieldSchema{FieldName: "$.payload", As: "payload", FieldType: redis.SearchFieldTypeText, NoIndex: true}
+	DocContentVec = &redis.FieldSchema{FieldName: "$.content_vec", As: "content_vec", FieldType: redis.SearchFieldTypeVector,
 		VectorArgs: &redis.FTVectorArgs{
 			FlatOptions: &redis.FTFlatOptions{
 				Type:           "FLOAT64",
 				Dim:            1024,
 				DistanceMetric: "COSINE",
 			},
-		}},
-}
+		}}
+)
 
-func (r *Retriever) Store(ctx context.Context, doc *Document, embedder Embedder) (err error) {
-	doc.ContentVec, err = embedder(ctx, doc.Content)
-	if err != nil {
-		return err
+type (
+	Retriever struct {
+		indexName string
+		docPrefix string
+		redisCli  *redis.Client
 	}
 
-	buf, err := json.Marshal(doc)
+	Document struct {
+		ID      string `json:"id"`
+		Tag     string `json:"tag"`
+		Content string `json:"content"`
+		Payload string `json:"payload"`
+	}
+)
+
+func (r *Retriever) Store(ctx context.Context, doc *Document, embedder Embedder) (err error) {
+	var vec []float64
+	vec, err = embedder(ctx, doc.Content)
 	if err != nil {
-		return err
+		return
+	}
+
+	var jsonData []byte
+	jsonData, err = json.Marshal(doc)
+	if err != nil {
+		return
 	}
 
 	// document key pattern: {Retriever.DocPrefix}:{Document.ID}
-	return r.RedisCli.JSONSet(ctx,
-		fmt.Sprintf("%s:%s", r.DocPrefix, doc.ID), "$", string(buf)).Err()
+	pipeline := r.redisCli.Pipeline()
+	key := fmt.Sprintf("%s:%s", r.docPrefix, doc.ID)
+	pipeline.JSONSet(ctx, key, "$", string(jsonData))
+	pipeline.JSONSet(ctx, key, DocContentVec.FieldName, vec)
+	_, err = pipeline.Exec(ctx)
+	return err
 }
 
 func (r *Retriever) Retrieve(ctx context.Context, content string, tag string, topK int, embedder Embedder) (docs []*Document, err error) {
-	vec, err := embedder(ctx, content)
+	var vec []float64
+	vec, err = embedder(ctx, content)
 	if err != nil {
-		return docs, err
+		return
 	}
 
 	opts := &redis.FTSearchOptions{
-		Return: []redis.FTSearchReturn{
-			{FieldName: field_id},
-			{FieldName: field_tag},
-			{FieldName: field_content},
-			{FieldName: field_payload},
-			{FieldName: field_score},
-		},
+		Return:         DocumentDefaultReturn,
 		DialectVersion: 2,
 		Params:         map[string]interface{}{"vec": []byte(vector2string(vec))},
 		SortBy: []redis.FTSearchSortBy{
-			{FieldName: field_score, Asc: true},
+			{FieldName: "score", Asc: true},
 		},
 	}
 
 	filter := "*"
 	if len(tag) > 0 {
-		filter = fmt.Sprintf("@tag:{%s}", strings.ReplaceAll(tag, ",", "|"))
+		filter = fmt.Sprintf("@%s:{%s}", DocTag.As, strings.ReplaceAll(tag, ",", "|"))
 	}
-	query := fmt.Sprintf("(%s)=>[KNN %d @contentvec $vec AS %s]", filter, topK, field_score)
-	cmd := r.RedisCli.FTSearchWithArgs(ctx, r.IndexName, query, opts)
+	query := fmt.Sprintf("(%s)=>[KNN %d @%s $vec AS %s]", filter, topK, DocContentVec.As, "score")
+	cmd := r.redisCli.FTSearchWithArgs(ctx, r.indexName, query, opts)
 	if res, err := cmd.Result(); err != nil {
 		return docs, err
 	} else if res.Total > 0 {
 		for _, raw := range res.Docs {
-			doc := raw2doc(&raw)
+			doc := parseDocument(&raw)
 			docs = append(docs, doc)
 		}
 	}
 	return
 }
 
-func raw2doc(res *redis.Document) *Document {
+func parseDocument(res *redis.Document) *Document {
 	var doc Document
 	for key, val := range res.Fields {
 		switch key {
-		case field_id:
+		case DocId.FieldName:
 			doc.ID = val
-		case field_content:
+		case DocContent.FieldName:
 			doc.Content = val
-		case field_tag:
+		case DocTag.FieldName:
 			doc.Tag = val
-		case field_payload:
+		case DocPayload.FieldName:
 			doc.Payload = val
 		}
 	}
